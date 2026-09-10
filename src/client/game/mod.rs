@@ -381,11 +381,14 @@ impl Game {
         // requests covers the player's actual surroundings. `tick_sim` keeps
         // the center following the player from then on.
         let player_world = player.coord();
-        range_loader.set_center(Vec3i::new(
-            player_world.x.floor() as i32,
-            player_world.y.floor() as i32,
-            player_world.z.floor() as i32,
-        ));
+        range_loader.set_center(
+            &world,
+            Vec3i::new(
+                player_world.x.floor() as i32,
+                player_world.y.floor() as i32,
+                player_world.z.floor() as i32,
+            ),
+        );
         range_loader.tick_chunk_loading(&world, &mut terrain_generator);
 
         // Start in basic G-buffer shape (diffuse + depth only). The
@@ -736,7 +739,7 @@ impl Game {
         );
         let player_chunk = chunk_coord(player_block);
         if self.range_loader.center_ccoord() != player_chunk {
-            self.range_loader.set_center(player_block);
+            self.range_loader.set_center(&self.world, player_block);
         }
 
         // Drive the async chunk pipeline (F5): issue load/unload requests.

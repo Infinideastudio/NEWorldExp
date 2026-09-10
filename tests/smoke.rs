@@ -73,7 +73,7 @@ fn round_trip_world_through_set_block_save_reopen() {
             World::new_at(scratch.path(), world_name.clone(), tables).expect("World::new_at");
         let mut terrain = TerrainGenerator::new(Arc::clone(&registry), base, seed);
         let mut loader = RangeLoader::new(render_distance);
-        loader.set_center(Vec3i::new(0, 0, 0));
+        loader.set_center(&world, Vec3i::new(0, 0, 0));
         pump_until_loaded(&mut world, &mut terrain, &mut loader, target_chunks);
         assert_eq!(
             world.loaded_count(),
@@ -114,7 +114,7 @@ fn round_trip_world_through_set_block_save_reopen() {
             World::new_at(scratch.path(), world_name.clone(), tables).expect("World::new_at");
         let mut terrain = TerrainGenerator::new(Arc::clone(&registry), base, seed);
         let mut loader = RangeLoader::new(render_distance);
-        loader.set_center(Vec3i::new(0, 0, 0));
+        loader.set_center(&world, Vec3i::new(0, 0, 0));
         pump_until_loaded(&mut world, &mut terrain, &mut loader, target_chunks);
 
         let after = world.block(coord).expect("block loaded after reopen").id;
@@ -138,7 +138,7 @@ fn slash_command_dispatch_through_full_stack() {
         World::new_at(scratch.path(), "smoke-cmd".to_owned(), tables).expect("World::new_at");
     let mut terrain = TerrainGenerator::new(Arc::clone(&registry), base, 0xDEAD_BEEF);
     let mut loader = RangeLoader::new(1);
-    loader.set_center(Vec3i::new(0, 0, 0));
+    loader.set_center(&world, Vec3i::new(0, 0, 0));
     pump_until_loaded(&mut world, &mut terrain, &mut loader, 27);
 
     let mut commands = CommandRegistry::new();
