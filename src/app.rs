@@ -209,11 +209,13 @@ impl App {
             // Mouse sensitivity. The TOML field is `mouse_speed`; the player
             // mouse-look code multiplies it by `π/180` (a 1° per pixel base).
             game.mouse_speed = f64::from(cfg.mouse_speed);
-            // Live render-distance update. World::set_render_distance is a
-            // no-op when the value matches; otherwise it rebuilds the
-            // height-map cache so subsequent `tick_chunk_loading_async`
-            // calls issue loads / unloads for the new window.
-            game.range_loader.set_render_distance(cfg.render_distance);
+            // Live render-distance update. Resizes the load window by
+            // diffing the new cube against the current one, feeding the
+            // difference into the loader's load / unload queues so
+            // subsequent `tick_chunk_loading` calls issue loads / unloads
+            // for the new window.
+            game.range_loader
+                .set_render_distance(&game.world, cfg.render_distance);
             // Mesh-options live-update. Drops every cached `ChunkMesh` and
             // re-marks the loaded set dirty when any of the three flags
             // changes; no-op otherwise.

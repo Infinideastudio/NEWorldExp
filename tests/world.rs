@@ -101,7 +101,7 @@ fn world_set_block_then_block_round_trips() {
     let scratch = ScratchDir::new("set-block");
     let (mut w, mut terrain, mut loader, base, registry) = build_world(&scratch, "set-block", 1);
     let mut q = neworld::core::game::block_update::BlockUpdateQueue::new();
-    loader.set_center(Vec3i::new(0, 0, 0));
+    loader.set_center(&w, Vec3i::new(0, 0, 0));
     pump_until_loaded(&mut w, &mut terrain, &mut loader, 125);
     let coord = Vec3i::new(1, 2, 3);
     neworld::core::game::block_update::set_block(
@@ -129,7 +129,7 @@ fn world_loads_chunk_visible_via_read_txn() {
     let scratch = ScratchDir::new("chunk-lookup");
     let (mut w, mut terrain, mut loader, _base, _registry) =
         build_world(&scratch, "chunk-lookup", 1);
-    loader.set_center(Vec3i::new(0, 0, 0));
+    loader.set_center(&w, Vec3i::new(0, 0, 0));
     pump_until_loaded(&mut w, &mut terrain, &mut loader, 125);
     let cc = Vec3i::new(0, 0, 0);
     assert!(w.is_loaded(cc));
@@ -142,13 +142,13 @@ fn world_loads_chunk_visible_via_read_txn() {
 
 #[test]
 fn world_set_center_does_not_unload_existing_chunks() {
-    // `set_center` only updates the centre + height-map cache; load /
-    // unload is `tick_chunk_loading`'s job. After a slide far past the
-    // old chunk, the chunk must still be reachable until the next
-    // `tick_chunk_loading` reaps it.
+    // `set_center` only diffs the window and queues work; load /
+    // unload execution is `tick_chunk_loading`'s job. After a slide
+    // far past the old chunk, the chunk must still be reachable until
+    // a `tick_chunk_loading` reaps it.
     let scratch = ScratchDir::new("set-center");
     let (mut w, mut terrain, mut loader, _base, _registry) = build_world(&scratch, "set-center", 1);
-    loader.set_center(Vec3i::new(0, 0, 0));
+    loader.set_center(&w, Vec3i::new(0, 0, 0));
     pump_until_loaded(&mut w, &mut terrain, &mut loader, 125);
     let cc = Vec3i::new(0, 0, 0);
     assert!(w.is_loaded(cc));
@@ -156,7 +156,7 @@ fn world_set_center_does_not_unload_existing_chunks() {
     // Slide far away — origin chunk is now outside the window, but no
     // unload tick has happened yet.
     let far = Vec3i::new(10_000, 0, 10_000);
-    loader.set_center(far * Chunk::SIZE as i32);
+    loader.set_center(&w, far * Chunk::SIZE as i32);
     assert!(w.is_loaded(cc), "set_center alone must not unload");
 
     // After ticking, the now-distant chunk gets reaped.
@@ -179,7 +179,7 @@ fn world_update_block_skips_when_neighbours_unloaded() {
     // which stays unloaded, so `update_block` must bail.
     let (w, mut terrain, mut loader, base, registry) = build_world(&scratch, "update-skip", 0);
     let mut q = neworld::core::game::block_update::BlockUpdateQueue::new();
-    loader.set_center(Vec3i::new(0, 0, 0));
+    loader.set_center(&w, Vec3i::new(0, 0, 0));
     loader.tick_chunk_loading(&w, &mut terrain);
     let coord = Vec3i::new(31, 5, 5);
     assert!(!neworld::core::game::block_update::update_block(
@@ -193,7 +193,7 @@ fn world_update_block_queues_neighbour_updates_when_all_loaded() {
     let scratch = ScratchDir::new("update-queue");
     let (mut w, mut terrain, mut loader, base, registry) = build_world(&scratch, "update-queue", 1);
     let mut q = neworld::core::game::block_update::BlockUpdateQueue::new();
-    loader.set_center(Vec3i::new(0, 0, 0));
+    loader.set_center(&w, Vec3i::new(0, 0, 0));
     pump_until_loaded(&mut w, &mut terrain, &mut loader, 125);
     let coord = Vec3i::new(2, 3, 4);
     let drained_before = q.len();
@@ -214,7 +214,7 @@ fn world_tick_chunk_loading_is_idempotent() {
     // assert one more tick adds nothing.
     let scratch = ScratchDir::new("idempotent");
     let (w, mut terrain, mut loader, _base, _registry) = build_world(&scratch, "idempotent", 1);
-    loader.set_center(Vec3i::new(0, 0, 0));
+    loader.set_center(&w, Vec3i::new(0, 0, 0));
     let mut prev = 0;
     for _ in 0..16 {
         loader.tick_chunk_loading(&w, &mut terrain);
@@ -227,6 +227,58 @@ fn world_tick_chunk_loading_is_idempotent() {
     loader.tick_chunk_loading(&w, &mut terrain);
     let n2 = w.loaded_count();
     assert_eq!(n1, n2, "post-stable tick should not double-load");
+}
+
+#[test]
+fn world_move_back_cancels_pending_unload() {
+    // Walk away one chunk: the origin chunk is queued for unload (but
+    // set_center never unloads synchronously). Walk back before any
+    // tick: the queued unload must be pruned, so a tick leaves the
+    // chunk resident.
+    let scratch = ScratchDir::new("move-back");
+    let (mut w, mut terrain, mut loader, _base, _registry) = build_world(&scratch, "move-back", 1);
+    loader.set_center(&w, Vec3i::new(0, 0, 0));
+    pump_until_loaded(&mut w, &mut terrain, &mut loader, 125);
+    let cc = Vec3i::new(0, 0, 0);
+    assert!(w.is_loaded(cc));
+
+    let one_chunk = Chunk::SIZE as i32;
+    loader.set_center(&w, Vec3i::new(one_chunk, 0, 0));
+    assert!(w.is_loaded(cc), "set_center alone must not unload");
+
+    loader.set_center(&w, Vec3i::new(0, 0, 0));
+    loader.tick_chunk_loading(&w, &mut terrain);
+    assert!(
+        w.is_loaded(cc),
+        "moving back must cancel the pending unload"
+    );
+}
+
+#[test]
+fn world_render_distance_change_loads_and_unloads() {
+    let scratch = ScratchDir::new("rd-change");
+    let (mut w, mut terrain, mut loader, _base, _registry) = build_world(&scratch, "rd-change", 1);
+    loader.set_center(&w, Vec3i::new(0, 0, 0));
+    pump_until_loaded(&mut w, &mut terrain, &mut loader, 125);
+
+    // Shrink to 0: only the 3×3×3 = 27 core chunks remain.
+    loader.set_render_distance(&w, 0);
+    for _ in 0..16 {
+        if w.loaded_count() <= 27 {
+            break;
+        }
+        loader.tick_chunk_loading(&w, &mut terrain);
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(w.is_loaded(Vec3i::new(0, 0, 0)), "core must stay resident");
+    assert!(
+        !w.is_loaded(Vec3i::new(2, 0, 0)),
+        "chunk outside the shrunk window must unload"
+    );
+
+    // Grow back: the ring re-loads (tiles are already cached).
+    loader.set_render_distance(&w, 1);
+    pump_until_loaded(&mut w, &mut terrain, &mut loader, 125);
 }
 
 #[test]

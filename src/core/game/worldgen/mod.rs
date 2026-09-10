@@ -20,4 +20,4 @@ mod erosion;
 mod perlin;
 mod terrain_generator;
 
-pub use terrain_generator::{TerrainGenerator, world_tables_for, world_tables_for_seed};
+pub use terrain_generator::{TerrainGenerator, TileKey, world_tables_for, world_tables_for_seed};
