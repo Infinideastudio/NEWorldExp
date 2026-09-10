@@ -47,9 +47,10 @@
 //!   and on-quit.
 //!
 //! Renderer-side mesh-dirty hooks (`mark_neighbour_chunks_updated`,
-//! `drain_updated_chunks`, `clear_updated_chunks`,
+//! `drain_updated_chunks`, `requeue_updated_chunks`,
 //! `mark_all_loaded_for_remesh`) currently live on `World` but are
-//! not part of the database interpretation; a future round will move
+//! not part of the database interpretation; they maintain the
+//! World-internal `mesh_dirty` coord set. A future round will move
 //! them to a renderer-side dirty-set.
 
 mod chunk;
@@ -64,12 +65,14 @@ pub use metadata::Metadata;
 pub use store::Store;
 pub use txn::{ReadTxn, TxnError, WorkingSet, WriteTxn};
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
+use parking_lot::Mutex;
 
 use crate::core::blocks::{BlockData, BlockId};
 use crate::core::math::{Vec3i, Vec3u};
@@ -137,6 +140,13 @@ pub struct World {
     /// LSN 0 is reserved as the "clean from_disk" sentinel in
     /// [`Chunk`].
     next_lsn: Arc<AtomicU64>,
+    /// Renderer-side mesh-dirty set: chunk coords whose mesh needs a
+    /// rebuild. Replaces the former per-chunk `updated` atomic —
+    /// drain is a set take (O(1)) instead of a full-table scan.
+    /// Main-thread only in practice; `parking_lot::Mutex` keeps it
+    /// correct if that ever changes. Unloading a chunk removes its
+    /// coord, so the set stays bounded by the resident count.
+    mesh_dirty: Mutex<HashSet<Vec3i>>,
 }
 
 impl World {
@@ -157,6 +167,7 @@ impl World {
             chunk_save_table: tables.save_table,
             chunks: DashMap::new(),
             next_lsn: Arc::new(AtomicU64::new(1)),
+            mesh_dirty: Mutex::new(HashSet::new()),
         })
     }
 
@@ -332,6 +343,7 @@ impl World {
         if let Err(err) = self.flush_chunk(ccoord, &chunk) {
             tracing::warn!(?ccoord, error = %err, "chunk save on unloading failed");
         }
+        self.mesh_dirty.lock().remove(&ccoord);
         self.chunks.remove(&ccoord);
     }
 
@@ -426,44 +438,40 @@ impl World {
 
     // ---- mesh-dirty tracking (TODO: factor out to render) ---------------
 
-    /// Renderer hook: snapshot of coords whose mesh-dirty atomic is set.
+    /// Renderer hook: take the whole mesh-dirty coord set. O(1) —
+    /// coords not re-queued by the renderer afterwards are cleared.
     pub fn drain_updated_chunks(&self) -> Vec<Vec3i> {
-        self.chunks
-            .iter()
-            .filter(|r| r.value().updated())
-            .map(|r| *r.key())
-            .collect()
+        let set = std::mem::take(&mut *self.mesh_dirty.lock());
+        set.into_iter().collect()
     }
 
-    /// Renderer hook: clear the mesh-dirty atomic on `coords` (called
-    /// by the renderer after it dispatches a remesh for each).
-    pub fn clear_updated_chunks(&self, coords: &[Vec3i]) {
-        for &cc in coords {
-            if let Some(s) = self.chunks.get(&cc) {
-                s.value().clear_updated();
-            }
-        }
+    /// Renderer hook: put `coords` back into the mesh-dirty set.
+    /// Called by the renderer with its drain snapshot minus the
+    /// coords it actually submitted, so skipped, rejected or
+    /// in-flight chunks reappear in a later drain.
+    pub fn requeue_updated_chunks(&self, coords: &[Vec3i]) {
+        self.mesh_dirty.lock().extend(coords.iter().copied());
     }
 
-    /// Renderer hook: mark every loaded chunk's mesh-dirty atomic.
-    /// Used to force a full re-mesh after meshing rules flip.
+    /// Renderer hook: mark every loaded chunk mesh-dirty. Used to
+    /// force a full re-mesh after meshing rules flip.
     pub fn mark_all_loaded_for_remesh(&self) {
-        for r in self.chunks.iter() {
-            r.value().mark_updated();
-        }
+        self.mesh_dirty
+            .lock()
+            .extend(self.chunks.iter().map(|r| *r.key()));
     }
 
-    /// Renderer hook: mark every chunk in the 3×3×3 cube around
-    /// `ccoord` as needing a re-mesh. Called after a chunk lands so
-    /// neighbouring chunks re-mesh against the real blocks.
+    /// Renderer hook: mark the 3×3×3 chunk cube around `ccoord` as
+    /// mesh-dirty. Called after a chunk lands so neighbouring
+    /// chunks re-mesh against the real blocks. Coords that are not
+    /// currently loaded are harmless: the meshing pump drops them,
+    /// and every chunk re-marks itself (and its cube) when it lands.
     pub fn mark_neighbour_chunks_updated(&self, ccoord: Vec3i) {
+        let mut guard = self.mesh_dirty.lock();
         for dz in -1..=1 {
             for dy in -1..=1 {
                 for dx in -1..=1 {
-                    let target = ccoord + Vec3i::new(dx, dy, dz);
-                    if let Some(s) = self.chunks.get(&target) {
-                        s.value().mark_updated();
-                    }
+                    guard.insert(ccoord + Vec3i::new(dx, dy, dz));
                 }
             }
         }

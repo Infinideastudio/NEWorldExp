@@ -58,7 +58,7 @@
 
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -244,7 +244,6 @@ pub struct Chunk {
     persisted_lsn: AtomicU64,
     leases: AtomicUsize,
     state: AtomicU8,
-    updated: AtomicBool,
 }
 
 impl Chunk {
@@ -265,7 +264,6 @@ impl Chunk {
             persisted_lsn: AtomicU64::new(0),
             leases: AtomicUsize::new(0),
             state: AtomicU8::new(RESIDENT),
-            updated: AtomicBool::new(false),
         })
     }
 
@@ -283,7 +281,6 @@ impl Chunk {
             persisted_lsn: AtomicU64::new(0),
             leases: AtomicUsize::new(0),
             state: AtomicU8::new(RESIDENT),
-            updated: AtomicBool::new(false),
         })
     }
 
@@ -381,18 +378,6 @@ impl Chunk {
     pub(super) fn dirty(&self) -> bool {
         let persisted = self.persisted_lsn.load(Ordering::Acquire);
         persisted < self.blocks.read().commit_lsn
-    }
-
-    // ---- updated (renderer hook) ---------------------------------------
-
-    pub(super) fn mark_updated(&self) {
-        self.updated.store(true, Ordering::Release);
-    }
-    pub(super) fn clear_updated(&self) {
-        self.updated.store(false, Ordering::Release);
-    }
-    pub(super) fn updated(&self) -> bool {
-        self.updated.load(Ordering::Acquire)
     }
 }
 
@@ -607,15 +592,5 @@ mod tests {
         drop(w);
         let r = c.read_owned();
         assert_eq!(r.commit_lsn, 7);
-    }
-
-    #[test]
-    fn updated_default_false_set_and_clear() {
-        let c = Chunk::from_disk(ChunkData::default());
-        assert!(!c.updated());
-        c.mark_updated();
-        assert!(c.updated());
-        c.clear_updated();
-        assert!(!c.updated());
     }
 }

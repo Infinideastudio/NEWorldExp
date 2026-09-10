@@ -543,8 +543,8 @@ impl Game {
         self.mesh_options = desired;
         self.chunk_meshes.clear();
         self.meshing_in_flight.clear();
-        // Re-mark every loaded non-empty chunk's `updated` flag in
-        // World. The next `pump_meshing` will see them through
+        // Re-insert every loaded chunk into World's mesh-dirty set.
+        // The next `pump_meshing` will see them through
         // `drain_updated_chunks` and rebuild against the new rules.
         self.world.mark_all_loaded_for_remesh();
     }
@@ -725,7 +725,7 @@ impl Game {
             self.daylight_cycle.advance(step);
             // No drain into a separate dirty queue — `pump_meshing` walks
             // `World::drain_updated_chunks` directly each frame and
-            // clears flags only on the chunks it actually meshed.
+            // re-queues everything it did not actually mesh.
         }
 
         // Slide the chunk grid + height map to follow the player. Mirrors
@@ -743,9 +743,10 @@ impl Game {
         }
 
         // Drive the async chunk pipeline (F5): issue load/unload requests.
-        // RangeLoader marks every freshly-arrived chunk's `updated` flag
-        // and those of its 26 neighbours via `World::mark_neighbour_chunks_updated`,
-        // so the next `drain_updated_chunks` covers the load-completion
+        // RangeLoader inserts every freshly-arrived chunk coord and those
+        // of its 26 neighbours into World's mesh-dirty set via
+        // `World::mark_neighbour_chunks_updated`, so the next
+        // `drain_updated_chunks` covers the load-completion
         // case automatically — no Game-side dirty-marking call needed.
         self.range_loader
             .tick_chunk_loading(&self.world, &mut self.terrain_generator);
@@ -849,13 +850,12 @@ impl Game {
     /// Call once per frame from `App::frame`, after [`Self::tick_sim`]. Splits
     /// from the simulation tick because the upload step needs `&wgpu::Device`.
     ///
-    /// Source of truth for "needs re-mesh" is `Chunk::updated()` in
-    /// World. We walk the lazy [`World::drain_updated_chunks`] iterator,
-    /// heap-pick the [`MAX_MESH_DISPATCHES_PER_FRAME`] closest dirty
-    /// chunks (filtered on not-in-flight + neighbours-loaded), submit
-    /// them, and explicitly clear the world flag only on the ones that
-    /// actually entered the worker queue. Skipped or rejected chunks
-    /// stay marked and reappear in the next frame's iterator.
+    /// Source of truth for "needs re-mesh" is World's `mesh_dirty`
+    /// coord set. [`World::drain_updated_chunks`] takes the whole set
+    /// in O(1); we heap-pick the [`MAX_MESH_DISPATCHES_PER_FRAME`]
+    /// closest dirty chunks (filtered on not-in-flight + loaded),
+    /// submit them, and re-queue everything we did not submit —
+    /// skipped or rejected chunks reappear in the next frame's drain.
     pub fn pump_meshing(&mut self, device: &wgpu::Device) {
         let player_world = self.player.coord();
         let player_chunk = chunk_coord(Vec3i::new(
@@ -864,17 +864,24 @@ impl Game {
             player_world.z.floor() as i32,
         ));
 
+        let drained = self.world.drain_updated_chunks();
+
         // Bounded max-heap keeps the closest `MAX_MESH_DISPATCHES_PER_FRAME`
         // dirty chunks. O(N log K) where N = dirty count, K = dispatch cap.
         let mut heap: BinaryHeap<ByDist> =
             BinaryHeap::with_capacity(MAX_MESH_DISPATCHES_PER_FRAME + 1);
-        for cc in self.world.drain_updated_chunks() {
-            if self.meshing_in_flight.contains(&cc) {
+        for cc in &drained {
+            if self.meshing_in_flight.contains(cc) {
                 continue;
             }
-            let d = cc - player_chunk;
+            // Stale entries: marked before the chunk (un)loaded. Safe to
+            // drop — every chunk re-marks itself when it lands.
+            if !self.world.is_loaded(*cc) {
+                continue;
+            }
+            let d = *cc - player_chunk;
             let dist = d.x * d.x + d.y * d.y + d.z * d.z;
-            heap.push(ByDist { dist, coord: cc });
+            heap.push(ByDist { dist, coord: *cc });
             if heap.len() > MAX_MESH_DISPATCHES_PER_FRAME {
                 heap.pop();
             }
@@ -903,7 +910,18 @@ impl Game {
                 submitted.push(coord);
             }
         }
-        self.world.clear_updated_chunks(&submitted);
+        // Re-queue everything we did not submit: in-flight chunks skipped
+        // above, neighbour-not-ready rejections from `build_mesh_input`,
+        // and worker-queue rejections — they must reappear in a later
+        // frame's drain.
+        if submitted.len() < drained.len() {
+            let submitted_set: HashSet<Vec3i> = submitted.iter().copied().collect();
+            let leftover: Vec<Vec3i> = drained
+                .into_iter()
+                .filter(|cc| !submitted_set.contains(cc))
+                .collect();
+            self.world.requeue_updated_chunks(&leftover);
+        }
 
         // ---- drain finished meshes ----
         for done in self.mesh_worker.drain() {
@@ -1556,9 +1574,9 @@ impl Game {
         // broken block's face art.
         let tex_layer = u32::from(self.render_registry.face(block.id, 0).0);
 
-        // `set_block` marks the cell's chunk and the parent chunks of its
-        // 26 block-neighbours as `updated`; `pump_meshing` picks them up
-        // via `World::drain_updated_chunks`.
+        // `set_block` inserts the cell's chunk and the parent chunks of
+        // its 26 block-neighbours into World's mesh-dirty set;
+        // `pump_meshing` picks them up via `World::drain_updated_chunks`.
         crate::core::game::block_update::set_block(
             &self.world,
             &mut self.block_update_queue,
