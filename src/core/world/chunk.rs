@@ -83,6 +83,42 @@ pub(super) const EVICTING: u8 = 1;
 /// `RwLock`.
 pub struct ChunkData([BlockData; Chunk::SIZE * Chunk::SIZE * Chunk::SIZE]);
 
+/// Per-thread scratch for [`ChunkData::package_to`]: the encode buffer,
+/// the compressed-output buffer, and the zstd compression context, all
+/// reused across calls.
+///
+/// The context is the expensive part. `zstd::bulk::compress` builds a
+/// fresh `CCtx` — allocating and initialising its match tables — on
+/// every call, which measured ~4× the cost of the compression itself
+/// (9.9 µs vs 2.6 µs per chunk). Streaming chunks in and out calls this
+/// tens of times per simulation tick, so the context is kept alive per
+/// thread instead. Costs one context plus ~40 KB of buffers per thread
+/// that ever saves a chunk (today: the sim thread).
+struct PackageScratch {
+    body: Box<[u8; ChunkData::DATA_SIZE]>,
+    compressed: Vec<u8>,
+    compressor: zstd::bulk::Compressor<'static>,
+}
+
+impl PackageScratch {
+    fn new() -> Self {
+        Self {
+            body: Box::new([0u8; ChunkData::DATA_SIZE]),
+            // `compress_to_buffer` writes into the destination's spare
+            // capacity, so this must be able to hold the worst case up
+            // front — zstd never grows it.
+            compressed: Vec::with_capacity(zstd::zstd_safe::compress_bound(ChunkData::DATA_SIZE)),
+            compressor: zstd::bulk::Compressor::new(ChunkData::COMPRESSION_LEVEL)
+                .expect("zstd compressor for a valid level cannot fail"),
+        }
+    }
+}
+
+thread_local! {
+    static PACKAGE_SCRATCH: std::cell::RefCell<PackageScratch> =
+        std::cell::RefCell::new(PackageScratch::new());
+}
+
 impl ChunkData {
     /// Magic bytes (`"NEWC"`) identifying a packaged chunk on disk.
     pub const MAGIC: u32 = 0x4E45_5743;
@@ -99,9 +135,12 @@ impl ChunkData {
     pub const DATA_SIZE: usize = Chunk::SIZE * Chunk::SIZE * Chunk::SIZE * BlockData::ENCODED_LEN;
 
     /// zstd compression level used when packaging a chunk. Level 3 is
-    /// zstd's "balanced" default — fast enough for save-on-evict on the
-    /// main thread (~tens of µs per chunk on contemporary CPUs) and
-    /// gives a strong ratio on homogeneous voxel data.
+    /// zstd's "balanced" default — with the reused context in
+    /// [`PackageScratch`] it costs ~2.6 µs per chunk, cheap enough for
+    /// save-on-evict on the main thread, and gives a strong ratio on
+    /// homogeneous voxel data. (Level 1 halves that again at the same
+    /// output size on voxel data; it is worth revisiting if the save
+    /// path ever becomes hot again.)
     pub const COMPRESSION_LEVEL: i32 = 3;
 
     /// Linear index for `(x, y, z)` block-local coords (X-major,
@@ -143,25 +182,37 @@ impl ChunkData {
     /// chunks (pure air above terrain, pure rock below) collapse
     /// almost to nothing, mixed chunks settle around 4–10×.
     pub fn package_to(&self, current_to_canonical: &[BlockId]) -> Vec<u8> {
-        let mut body = Vec::with_capacity(Self::DATA_SIZE);
-        let identity = current_to_canonical.is_empty();
-        for cell in self.0.iter() {
-            let mut translated = *cell;
-            if !identity {
-                translated.id = current_to_canonical
-                    .get(cell.id.get() as usize)
-                    .copied()
-                    .unwrap_or(BlockId::default());
+        PACKAGE_SCRATCH.with_borrow_mut(|scratch| {
+            let identity = current_to_canonical.is_empty();
+            for (cell, slot) in self
+                .0
+                .iter()
+                .zip(scratch.body.chunks_exact_mut(BlockData::ENCODED_LEN))
+            {
+                let mut translated = *cell;
+                if !identity {
+                    translated.id = current_to_canonical
+                        .get(cell.id.get() as usize)
+                        .copied()
+                        .unwrap_or(BlockId::default());
+                }
+                translated.encode_into(slot);
             }
-            translated.encode_to(&mut body);
-        }
-        let compressed = zstd::bulk::compress(&body, Self::COMPRESSION_LEVEL)
-            .expect("zstd compression of a fixed-size buffer cannot fail");
-        let mut out = Vec::with_capacity(Self::HEADER_SIZE + compressed.len());
-        out.extend_from_slice(&Self::MAGIC.to_le_bytes());
-        out.extend_from_slice(&Self::VERSION.to_le_bytes());
-        out.extend_from_slice(&compressed);
-        out
+            // `compress_to_buffer` writes from the start of the destination
+            // and sets its length, so it gets a buffer of its own; the
+            // header is prepended when the result is copied out.
+            scratch.compressed.clear();
+            let n = scratch
+                .compressor
+                .compress_to_buffer(&scratch.body[..], &mut scratch.compressed)
+                .expect("zstd compression of a fixed-size buffer cannot fail");
+            debug_assert_eq!(n, scratch.compressed.len());
+            let mut out = Vec::with_capacity(Self::HEADER_SIZE + n);
+            out.extend_from_slice(&Self::MAGIC.to_le_bytes());
+            out.extend_from_slice(&Self::VERSION.to_le_bytes());
+            out.extend_from_slice(&scratch.compressed);
+            out
+        })
     }
 
     /// Deserialize bytes (produced by [`Self::package_to`]) into
