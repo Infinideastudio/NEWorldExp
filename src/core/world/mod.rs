@@ -428,7 +428,6 @@ impl World {
                 return Ok(());
             }
             captured_lsn = guard.commit_lsn;
-            tracing::info!(?ccoord, lsn = captured_lsn, "flushing dirty chunk");
             bytes = guard.data.package_to(&self.chunk_save_table);
         }
         self.store.save(ccoord, &bytes)?;
