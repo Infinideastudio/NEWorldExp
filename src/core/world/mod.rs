@@ -21,9 +21,12 @@
 //! outstanding leases to drop, flushes, then removes the entry.
 //! See [`chunk`] for the full discipline.
 //!
-//! Each `WriteTxn::commit` allocates one LSN from
-//! [`World::next_lsn`]; that LSN becomes the chunks' `commit_lsn`
-//! under their write guards. The pair `persisted_lsn < commit_lsn`
+//! Each non-empty `WriteTxn::commit` allocates one LSN from the
+//! world's monotonic counter. A touched chunk is stamped with it
+//! only when the commit actually changed that chunk's *content* —
+//! a cell's `(id, state)` differing between its pre-commit value
+//! and its last-write-wins buffered value; pure light writes land
+//! in memory but never stamp. The pair `persisted_lsn < commit_lsn`
 //! drives writeback's "dirty" flag; the LSN ordering itself
 //! linearises all committed write txns into a single sequence.
 //!
@@ -36,6 +39,10 @@
 //! **Save policy.**
 //! - [`World::load_chunk`] tries to load the chunk from disk first;
 //!   only on miss does it call the caller-supplied generator closure.
+//! - Freshly generated chunks are born clean: they reach disk only
+//!   after a commit actually changes their content, so the save set
+//!   is exactly the set of content-edited chunks — unedited chunks
+//!   regenerate from the world seed.
 //! - [`World::unload_chunk`] starts the eviction state machine:
 //!   refuse new leases, drain, flush, remove. If a chunk has
 //!   uncommitted changes they are persisted synchronously first; on
@@ -66,7 +73,7 @@ pub use txn::{ReadTxn, TxnError, WorkingSet, WriteTxn};
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
@@ -132,10 +139,10 @@ pub struct World {
     /// itself does not pin the chunk against eviction — only a
     /// [`Lease`] does.
     chunks: DashMap<Vec3i, Arc<Chunk>>,
-    /// Monotone source of commit ordering. Each `WriteTxn::commit`
-    /// (and each [`Chunk::from_gen`]) allocates one. Starts at 1;
-    /// LSN 0 is reserved as the "clean from_disk" sentinel in
-    /// [`Chunk`].
+    /// Monotone source of commit ordering. Each non-empty
+    /// `WriteTxn::commit` allocates one. Starts at 1; LSN 0 is the
+    /// "clean" sentinel every chunk is born with (`from_disk` and
+    /// `from_generated` alike).
     next_lsn: Arc<AtomicU64>,
 }
 
@@ -225,15 +232,10 @@ impl World {
         chunk.value().try_acquire_lease()
     }
 
-    /// Allocate the next commit LSN. Called by [`WriteTxn::commit`]
-    /// and by [`Self::load_chunk`] for freshly-generated terrain.
-    pub(super) fn next_lsn(&self) -> u64 {
-        self.next_lsn.fetch_add(1, Ordering::AcqRel)
-    }
-
     /// Hand out a clone of the LSN counter Arc — `WriteTxn` carries
     /// one to allocate an LSN at commit time without holding a
-    /// reference back to the world.
+    /// reference back to the world. Freshly-generated terrain no
+    /// longer consumes LSNs (generated chunks are born clean).
     pub(super) fn lsn_counter(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.next_lsn)
     }
@@ -274,6 +276,10 @@ impl World {
     /// hand in pre-generated blocks (e.g. from an async worker)
     /// without wasting them on hits.
     ///
+    /// Freshly generated chunks are born clean (`from_generated`
+    /// takes no LSN) — only a later content-changing commit can
+    /// make them dirty and hence eligible for writeback.
+    ///
     /// No-op if a resident chunk already exists at `ccoord`. If the
     /// chunk is mid-eviction, spins until the evictor finishes and
     /// then re-tries the install.
@@ -302,12 +308,12 @@ impl World {
                         Ok(Some(data)) => Chunk::from_disk(data),
                         Ok(None) => {
                             let f = init.take().expect("init only consumed once");
-                            Chunk::from_generated(f(), self.next_lsn())
+                            Chunk::from_generated(f())
                         }
                         Err(err) => {
                             tracing::warn!(?ccoord, error = %err, "chunk disk load failed; regenerating");
                             let f = init.take().expect("init only consumed once");
-                            Chunk::from_generated(f(), self.next_lsn())
+                            Chunk::from_generated(f())
                         }
                     };
                     vacant.insert(new_chunk);

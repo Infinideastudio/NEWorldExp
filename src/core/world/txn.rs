@@ -18,9 +18,12 @@
 //! A `WriteTxn` buffers writes locally and applies them at commit
 //! time under the held write guards. The commit point is a single
 //! LSN allocated from `World`'s monotonic counter, written into
-//! each touched chunk's `commit_lsn` under its write guard. Commit
-//! point = LSN allocation; visibility point = guard release. The
-//! linearised order over all commits is exactly the LSN order.
+//! each touched chunk's `commit_lsn` under its write guard — but
+//! only chunks whose *content* (`(id, state)`, light aside) the
+//! commit actually changed are stamped; pure light writes leave
+//! the chunk clean. Commit point = LSN allocation; visibility
+//! point = guard release. The linearised order over all commits is
+//! exactly the LSN order.
 //!
 //! Reads and writes outside the declared set return
 //! [`TxnError::OutOfRange`].
@@ -200,10 +203,17 @@ impl WriteTxn {
     }
 
     /// Apply all buffered writes in place under the held write
-    /// guards, allocate a single LSN, and stamp it as `commit_lsn`
-    /// on every touched chunk. Stamping happens under each held
-    /// write guard, so any reader who later acquires the chunk's
-    /// lock sees a consistent (data, commit_lsn) pair.
+    /// guards. Allocates a single LSN per non-empty commit and
+    /// stamps it as `commit_lsn` on every touched chunk **whose
+    /// content the commit actually changed** — content is a cell's
+    /// `(id, state)`, compared last-write-wins against the
+    /// pre-commit value. Pure light writes still land (the renderer
+    /// samples in-memory light) but leave the chunk clean, so light
+    /// relaxation alone never sends a chunk to disk.
+    ///
+    /// Stamping happens under each held write guard, so any reader
+    /// who later acquires the chunk's lock sees a consistent
+    /// (data, commit_lsn) pair.
     ///
     /// On return, the entries' write guards drop first (commit
     /// point — visible to subsequent txns), then the leases drop
@@ -219,10 +229,27 @@ impl WriteTxn {
                 debug_assert!(false, "buffered write for coord without entry");
                 continue;
             };
+            // Last-write-wins final value per buffered cell, gathered
+            // BEFORE anything is applied: `guard.data` still holds the
+            // pre-commit state here.
+            let mut finals: HashMap<Vec3u, BlockData> = HashMap::with_capacity(writes.len());
+            for (bcoord, data) in &writes {
+                finals.insert(*bcoord, *data);
+            }
+            // Content = (id, state); light is runtime-only. Stamp the
+            // chunk iff its content actually changed — a light-only
+            // commit updates memory but leaves the chunk clean, and a
+            // content write reverted within the txn is a no-op.
+            let content_changed = finals.iter().any(|(bcoord, data)| {
+                let orig = entry.guard.data.block(*bcoord);
+                orig.id != data.id || orig.state != data.state
+            });
             for (bcoord, data) in writes {
                 *entry.guard.data.block_mut(bcoord) = data;
             }
-            entry.guard.commit_lsn = lsn;
+            if content_changed {
+                entry.guard.commit_lsn = lsn;
+            }
         }
     }
 }
@@ -301,7 +328,7 @@ fn acquire_leases(world: &World, coords: &[Vec3i]) -> Result<Vec<Lease>, TxnErro
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::blocks::BlockId;
+    use crate::core::blocks::{BlockId, BlockLight, BlockState};
     use crate::core::world::{Metadata, WorldTables};
 
     /// Tiny RAII scratch dir — `tempfile` isn't a dev-dep on this
@@ -356,6 +383,20 @@ mod tests {
         for &c in coords {
             world.load_chunk(c, ChunkData::default);
         }
+    }
+
+    fn chunk_dirty(world: &World, cc: Vec3i) -> bool {
+        world.chunks.get(&cc).expect("chunk loaded").value().dirty()
+    }
+
+    fn chunk_commit_lsn(world: &World, cc: Vec3i) -> u64 {
+        world
+            .chunks
+            .get(&cc)
+            .expect("chunk loaded")
+            .value()
+            .read_owned()
+            .commit_lsn
     }
 
     #[test]
@@ -485,6 +526,179 @@ mod tests {
         wtxn.write(coord, target).expect("in range");
         let b = wtxn.read(coord).expect("in range");
         assert_eq!(b.id, BlockId::new(1));
+    }
+
+    #[test]
+    fn light_only_commit_updates_memory_but_keeps_chunk_clean() {
+        let (_dir, world) = temp_world();
+        let cc = Vec3i::new(0, 0, 0);
+        install_chunks(&world, &[cc]);
+
+        let mut wtxn = world
+            .begin_write_txn_sync(WorkingSet::Single(cc))
+            .expect("loaded");
+        wtxn.write(
+            Vec3i::new(1, 1, 1),
+            BlockData {
+                light: BlockLight::sky_and_block(15, 0),
+                ..BlockData::default()
+            },
+        )
+        .expect("in range");
+        wtxn.commit();
+
+        assert!(!chunk_dirty(&world, cc));
+        assert_eq!(chunk_commit_lsn(&world, cc), 0);
+        // The light write itself still landed.
+        let rtxn = world
+            .begin_read_txn_sync(WorkingSet::Single(cc))
+            .expect("loaded");
+        assert_eq!(
+            rtxn.read(Vec3i::new(1, 1, 1)).expect("in range").light,
+            BlockLight::sky_and_block(15, 0)
+        );
+    }
+
+    #[test]
+    fn content_commit_marks_chunk_dirty() {
+        let (_dir, world) = temp_world();
+        let cc = Vec3i::new(0, 0, 0);
+        install_chunks(&world, &[cc]);
+
+        let mut wtxn = world
+            .begin_write_txn_sync(WorkingSet::Single(cc))
+            .expect("loaded");
+        wtxn.write(
+            Vec3i::new(2, 2, 2),
+            BlockData {
+                id: BlockId::new(5),
+                ..BlockData::default()
+            },
+        )
+        .expect("in range");
+        wtxn.commit();
+
+        assert!(chunk_dirty(&world, cc));
+        assert!(chunk_commit_lsn(&world, cc) > 0);
+    }
+
+    #[test]
+    fn state_only_commit_marks_chunk_dirty() {
+        let (_dir, world) = temp_world();
+        let cc = Vec3i::new(0, 0, 0);
+        install_chunks(&world, &[cc]);
+
+        let mut wtxn = world
+            .begin_write_txn_sync(WorkingSet::Single(cc))
+            .expect("loaded");
+        wtxn.write(
+            Vec3i::new(2, 2, 2),
+            BlockData {
+                state: BlockState::inline(3),
+                ..BlockData::default()
+            },
+        )
+        .expect("in range");
+        wtxn.commit();
+
+        assert!(chunk_dirty(&world, cc));
+    }
+
+    #[test]
+    fn content_reverted_within_txn_keeps_chunk_clean() {
+        let (_dir, world) = temp_world();
+        let cc = Vec3i::new(0, 0, 0);
+        install_chunks(&world, &[cc]);
+
+        // Same cell: change content, then restore the original
+        // BlockData — last-write-wins equals the pre-commit value.
+        let mut wtxn = world
+            .begin_write_txn_sync(WorkingSet::Single(cc))
+            .expect("loaded");
+        wtxn.write(
+            Vec3i::new(3, 3, 3),
+            BlockData {
+                id: BlockId::new(9),
+                ..BlockData::default()
+            },
+        )
+        .expect("in range");
+        wtxn.write(Vec3i::new(3, 3, 3), BlockData::default())
+            .expect("in range");
+        wtxn.commit();
+
+        assert!(!chunk_dirty(&world, cc));
+    }
+
+    #[test]
+    fn mixed_light_and_content_commit_is_dirty_and_applies_light() {
+        let (_dir, world) = temp_world();
+        let cc = Vec3i::new(0, 0, 0);
+        install_chunks(&world, &[cc]);
+
+        let mut wtxn = world
+            .begin_write_txn_sync(WorkingSet::Single(cc))
+            .expect("loaded");
+        wtxn.write(
+            Vec3i::new(4, 4, 4),
+            BlockData {
+                light: BlockLight::sky_and_block(9, 3),
+                ..BlockData::default()
+            },
+        )
+        .expect("in range");
+        wtxn.write(
+            Vec3i::new(5, 5, 5),
+            BlockData {
+                id: BlockId::new(2),
+                ..BlockData::default()
+            },
+        )
+        .expect("in range");
+        wtxn.commit();
+
+        assert!(chunk_dirty(&world, cc));
+        let rtxn = world
+            .begin_read_txn_sync(WorkingSet::Single(cc))
+            .expect("loaded");
+        assert_eq!(
+            rtxn.read(Vec3i::new(4, 4, 4)).expect("in range").light,
+            BlockLight::sky_and_block(9, 3)
+        );
+    }
+
+    #[test]
+    fn multi_chunk_txn_stamps_only_content_changed_chunks() {
+        // One txn over two chunks: content change in `a`, light-only
+        // in `b`. `a` stamps, `b` stays clean.
+        let (_dir, world) = temp_world();
+        let a = Vec3i::new(0, 0, 0);
+        let b = Vec3i::new(1, 0, 0);
+        install_chunks(&world, &[a, b]);
+
+        let mut wtxn = world
+            .begin_write_txn_sync(WorkingSet::List(vec![a, b]))
+            .expect("loaded");
+        wtxn.write(
+            Vec3i::new(0, 0, 0),
+            BlockData {
+                id: BlockId::new(4),
+                ..BlockData::default()
+            },
+        )
+        .expect("in range");
+        wtxn.write(
+            Vec3i::new(16, 0, 0), // block-local (0,0,0) of chunk b
+            BlockData {
+                light: BlockLight::sky_and_block(3, 5),
+                ..BlockData::default()
+            },
+        )
+        .expect("in range");
+        wtxn.commit();
+
+        assert!(chunk_dirty(&world, a));
+        assert!(!chunk_dirty(&world, b));
     }
 
     #[test]

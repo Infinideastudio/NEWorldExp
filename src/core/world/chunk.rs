@@ -269,22 +269,13 @@ impl Chunk {
         })
     }
 
-    /// Build a chunk for freshly-generated terrain. `lsn` must be a
-    /// non-zero LSN allocated from the world's counter; storing it
-    /// in `commit_lsn` while `persisted_lsn` stays zero marks the
-    /// chunk dirty until writeback.
-    pub(super) fn from_generated(data: ChunkData, lsn: u64) -> Arc<Self> {
-        debug_assert!(lsn > 0, "lsn 0 is reserved for clean from_disk chunks");
-        Arc::new(Self {
-            blocks: RwLock::new(ChunkInner {
-                data,
-                commit_lsn: lsn,
-            }),
-            persisted_lsn: AtomicU64::new(0),
-            leases: AtomicUsize::new(0),
-            state: AtomicU8::new(RESIDENT),
-            updated: AtomicBool::new(false),
-        })
+    /// Build a chunk for freshly-generated terrain. Born clean —
+    /// `(commit_lsn, persisted_lsn) = (0, 0)`, same as
+    /// [`Self::from_disk`]: the chunk reaches disk only after a
+    /// [`super::txn::WriteTxn::commit`] actually changes its
+    /// content (`(id, state)`, light aside).
+    pub(super) fn from_generated(data: ChunkData) -> Arc<Self> {
+        Self::from_disk(data)
     }
 
     // ---- lease + eviction state ----------------------------------------
@@ -542,15 +533,16 @@ mod tests {
     }
 
     #[test]
-    fn from_gen_starts_dirty() {
-        let c = Chunk::from_generated(ChunkData::default(), 1);
+    fn from_generated_starts_clean() {
+        let c = Chunk::from_generated(ChunkData::default());
         assert_eq!(c.persisted_lsn(), 0);
-        assert!(c.dirty());
+        assert!(!c.dirty());
     }
 
     #[test]
     fn writeback_clears_dirty() {
-        let c = Chunk::from_generated(ChunkData::default(), 3);
+        let c = Chunk::from_disk(ChunkData::default());
+        c.write_owned().commit_lsn = 3;
         assert!(c.dirty());
         c.advance_persisted_lsn(3);
         assert!(!c.dirty());
