@@ -354,7 +354,7 @@ impl Inventory {
         painter.rect_stroke(
             rect,
             2.0,
-            Stroke::new(1.0, border),
+            Stroke::new(1.0_f32, border),
             egui::StrokeKind::Middle,
         );
 
