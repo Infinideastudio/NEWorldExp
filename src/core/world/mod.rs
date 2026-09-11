@@ -47,7 +47,7 @@
 //!   and on-quit.
 //!
 //! Renderer-side mesh-dirty hooks (`mark_neighbour_chunks_updated`,
-//! `drain_updated_chunks`, `requeue_updated_chunks`,
+//! `dirty_snapshot`, `remove_dirty_chunks`,
 //! `mark_all_loaded_for_remesh`) currently live on `World` but are
 //! not part of the database interpretation; they maintain the
 //! World-internal `mesh_dirty` coord set. A future round will move
@@ -141,8 +141,9 @@ pub struct World {
     /// [`Chunk`].
     next_lsn: Arc<AtomicU64>,
     /// Renderer-side mesh-dirty set: chunk coords whose mesh needs a
-    /// rebuild. Replaces the former per-chunk `updated` atomic —
-    /// drain is a set take (O(1)) instead of a full-table scan.
+    /// rebuild. Replaces the former per-chunk `updated` atomic — the
+    /// renderer snapshots it and evicts only the coords it submitted,
+    /// instead of a full-table scan or a drain/requeue round-trip.
     /// Main-thread only in practice; `parking_lot::Mutex` keeps it
     /// correct if that ever changes. Unloading a chunk removes its
     /// coord, so the set stays bounded by the resident count.
@@ -437,19 +438,26 @@ impl World {
 
     // ---- mesh-dirty tracking (TODO: factor out to render) ---------------
 
-    /// Renderer hook: take the whole mesh-dirty coord set. O(1) —
-    /// coords not re-queued by the renderer afterwards are cleared.
-    pub fn drain_updated_chunks(&self) -> Vec<Vec3i> {
-        let set = std::mem::take(&mut *self.mesh_dirty.lock());
-        set.into_iter().collect()
+    /// Renderer hook: snapshot of the mesh-dirty coord set. O(N) copy
+    /// with no hashing — the set itself is not modified; the renderer
+    /// heap-selects from the snapshot and evicts exactly the coords it
+    /// submitted via [`Self::remove_dirty_chunks`]. Unloading a chunk
+    /// removes its coord from the set ([`Self::unload_chunk`]), so
+    /// stale entries are pruned eagerly and the set never grows with
+    /// explored-and-forgotten terrain.
+    pub fn dirty_snapshot(&self) -> Vec<Vec3i> {
+        self.mesh_dirty.lock().iter().copied().collect()
     }
 
-    /// Renderer hook: put `coords` back into the mesh-dirty set.
-    /// Called by the renderer with its drain snapshot minus the
-    /// coords it actually submitted, so skipped, rejected or
-    /// in-flight chunks reappear in a later drain.
-    pub fn requeue_updated_chunks(&self, coords: &[Vec3i]) {
-        self.mesh_dirty.lock().extend(coords.iter().copied());
+    /// Renderer hook: evict `coords` from the mesh-dirty set. Called
+    /// with the snapshot coords whose mesh jobs were actually submitted
+    /// this frame; everything else (in-flight re-marks, neighbour-not-
+    /// ready, worker rejections) stays for a later frame.
+    pub fn remove_dirty_chunks(&self, coords: &[Vec3i]) {
+        let mut guard = self.mesh_dirty.lock();
+        for cc in coords {
+            guard.remove(cc);
+        }
     }
 
     /// Renderer hook: mark every loaded chunk mesh-dirty. Used to
@@ -462,15 +470,20 @@ impl World {
 
     /// Renderer hook: mark the 3×3×3 chunk cube around `ccoord` as
     /// mesh-dirty. Called after a chunk lands so neighbouring
-    /// chunks re-mesh against the real blocks. Coords that are not
-    /// currently loaded are harmless: the meshing pump drops them,
-    /// and every chunk re-marks itself (and its cube) when it lands.
+    /// chunks re-mesh against the real blocks. Only loaded coords
+    /// are inserted — unloading a chunk removes its coord, so the
+    /// set stays bounded by the resident count, and the meshing pump
+    /// never needs an `is_loaded` guard on drained coords. Chunks
+    /// that land later re-mark themselves and their cube.
     pub fn mark_neighbour_chunks_updated(&self, ccoord: Vec3i) {
         let mut guard = self.mesh_dirty.lock();
         for dz in -1..=1 {
             for dy in -1..=1 {
                 for dx in -1..=1 {
-                    guard.insert(ccoord + Vec3i::new(dx, dy, dz));
+                    let target = ccoord + Vec3i::new(dx, dy, dz);
+                    if self.is_loaded(target) {
+                        guard.insert(target);
+                    }
                 }
             }
         }
