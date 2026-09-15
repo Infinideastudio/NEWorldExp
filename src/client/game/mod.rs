@@ -871,7 +871,10 @@ impl Game {
         let snapshot = self.world.dirty_snapshot();
 
         // Bounded max-heap keeps the closest `MAX_MESH_DISPATCHES_PER_FRAME`
-        // dirty chunks. O(N log K) where N = dirty count, K = dispatch cap.
+        // dirty chunks. `peek()` reads the worst kept candidate in O(1), so
+        // each of the N = dirty count coords costs one compare and only the
+        // accepted ones pay O(log K) heap ops (K = dispatch cap): average
+        // O(N + K log K * log(N/K)) instead of the previous O(NlogK) method.
         let mut heap: BinaryHeap<ByDist> =
             BinaryHeap::with_capacity(MAX_MESH_DISPATCHES_PER_FRAME + 1);
         for cc in &snapshot {
@@ -880,9 +883,11 @@ impl Game {
             }
             let d = *cc - player_chunk;
             let dist = d.x * d.x + d.y * d.y + d.z * d.z;
-            heap.push(ByDist { dist, coord: *cc });
-            if heap.len() > MAX_MESH_DISPATCHES_PER_FRAME {
-                heap.pop();
+            if heap.len() == 0 || dist < heap.peek().unwrap().dist {
+                heap.push(ByDist { dist, coord: *cc });
+                if heap.len() > MAX_MESH_DISPATCHES_PER_FRAME {
+                    heap.pop();
+                }
             }
         }
         // Closest-first iteration order so visible neighbourhood meshes
